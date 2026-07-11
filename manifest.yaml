@@ -1,0 +1,27 @@
+manifestVersion: 1
+name: "@shrug/grafana-ext"
+version: "2026.07.11.1"
+description: "Grafana swamp-native gaps: a control-plane admin model (idempotent ensureServiceAccount over basic-auth) plus a queryLogs extension that adds LogQL/Loki reads to @keeb/grafana/instance alongside its queryMetrics."
+
+repository: https://github.com/shrugpw/swamp-grafana-ext
+
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+
+# grafana_admin.ts  -> export const model     (@shrug/grafana-admin/instance)
+# grafana_logs.ts   -> export const extension (adds queryLogs to @keeb/grafana/instance)
+models:
+  - grafana_admin.ts
+  - grafana_logs.ts
+
+# Empty platforms == universal. Both talk HTTPS to the Grafana API via fetch();
+# no host binaries are shelled out, so it runs anywhere.
+platforms: []
+
+labels:
+  - grafana
+  - observability
+  - service-accounts
+  - loki
+  - logs

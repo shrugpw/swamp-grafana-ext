@@ -1,0 +1,36 @@
+# === PUBLIC MIRROR whitelist (github.com/shrugpw/swamp-grafana-ext) ===
+# This dir is BOTH the local swamp dev tree (nested .swamp/ runtime state,
+# vault refs, CLAUDE.md, model instances that reference real infra) AND the git
+# checkout of the PUBLIC package mirror. Whitelist strategy: ignore everything,
+# then re-include only the published package files, so dev/secret/infra state
+# can NEVER be committed to the public repo.
+
+# Ignore everything...
+/*
+
+# ...but keep the published package files.
+!/.gitignore
+!/README.md
+!/LICENSE.txt
+!/manifest.yaml
+!/extensions/
+
+# Within extensions/, ignore everything then re-include only the source
+# (models + tests).
+extensions/*
+!extensions/models/
+
+# BEGIN swamp managed section - DO NOT EDIT
+
+# Runtime data (not needed in version control)
+.swamp/
+
+# Local extension sources (developer-specific, not shared)
+.swamp-sources.yaml
+
+# Claude Code configuration (managed by swamp)
+.claude/worktrees/
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/scheduled_tasks.json
+# END swamp managed section
