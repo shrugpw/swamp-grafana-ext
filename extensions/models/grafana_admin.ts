@@ -1044,7 +1044,7 @@ export async function ensureDatasource(
  */
 export const model = {
   type: "@shrug/grafana-admin/instance",
-  version: "2026.11.16.1",
+  version: "2026.11.18.1",
   description:
     "Grafana control-plane over admin basic-auth: list orgs, idempotently ensure an org, a tenant-scoped datasource (X-Scope-OrgID in secureJsonData), a service account (and optionally mint its token), a webhook (e.g. ntfy) contact point, or a folder. Dry-run by default; confirm:true to apply.",
   globalArguments: GlobalArgsSchema,
