@@ -16,7 +16,9 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1";
 import {
   configureWebhookContactPoint,
+  ensureDatasource,
   ensureFolder,
+  ensureOrg,
   ensureServiceAccount,
   listOrgs,
 } from "./grafana_admin.ts";
@@ -523,5 +525,208 @@ Deno.test("ensureFolder: empty title is rejected", async () => {
     () => ensureFolder({ ...folderArgs, title: "" }, context),
     Error,
     "title is required",
+  );
+});
+
+// --- ensureOrg --------------------------------------------------------------
+
+const orgArgs = { name: "AcmeCorp", confirm: false };
+
+Deno.test("ensureOrg dry run: plans create, mutates nothing (no org switch)", async () => {
+  const mock = installFetch({
+    "GET /api/orgs": { body: [{ id: 1, name: "Main Org." }] },
+  });
+  try {
+    const { context, writes } = stubContext();
+    await ensureOrg({ ...orgArgs }, context);
+    // Only the read happened — org CRUD never switches the active org.
+    assertEquals(
+      mock.calls.some((c) => c.method === "POST" && c.path === "/api/orgs"),
+      false,
+    );
+    assertEquals(
+      mock.calls.some((c) => c.path.startsWith("/api/user/using/")),
+      false,
+    );
+    const w = writes[0].data;
+    assertEquals(w.existed, false);
+    assertEquals(w.mutated, false);
+    assertEquals((w.plannedActions as string[]).length, 1);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("ensureOrg idempotent: existing org returns id, no create even with confirm", async () => {
+  const mock = installFetch({
+    "GET /api/orgs": {
+      body: [{ id: 1, name: "Main Org." }, { id: 2, name: "AcmeCorp" }],
+    },
+  });
+  try {
+    const { context, writes } = stubContext();
+    await ensureOrg({ ...orgArgs, confirm: true }, context);
+    assertEquals(
+      mock.calls.some((c) => c.method === "POST" && c.path === "/api/orgs"),
+      false,
+    );
+    const w = writes[0].data;
+    assertEquals(w.existed, true);
+    assertEquals(w.mutated, false);
+    assertEquals(w.orgId, 2);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("ensureOrg confirm: creates when absent and returns the new orgId", async () => {
+  const mock = installFetch({
+    "GET /api/orgs": { body: [{ id: 1, name: "Main Org." }] },
+    "POST /api/orgs": { body: { orgId: 7, message: "Organization created" } },
+  });
+  try {
+    const { context, writes } = stubContext();
+    await ensureOrg({ ...orgArgs, confirm: true }, context);
+    const post = mock.calls.find((c) =>
+      c.method === "POST" && c.path === "/api/orgs"
+    );
+    assertEquals(post?.body, { name: "AcmeCorp" });
+    const w = writes[0].data;
+    assertEquals(w.mutated, true);
+    assertEquals(w.existed, false);
+    assertEquals(w.orgId, 7);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("ensureOrg: empty name is rejected", async () => {
+  const { context } = stubContext();
+  await assertRejects(
+    () => ensureOrg({ ...orgArgs, name: "" }, context),
+    Error,
+    "name is required",
+  );
+});
+
+// --- ensureDatasource -------------------------------------------------------
+
+const dsArgs = {
+  orgId: 2,
+  name: "Mimir (acme)",
+  dsType: "prometheus" as const,
+  url: "https://ingest.example.com",
+  tenant: "acme",
+  isDefault: false,
+  confirm: false,
+};
+
+Deno.test("ensureDatasource dry run: plans create, mutates nothing, restores org", async () => {
+  const mock = installFetch({
+    "GET /api/user": { body: { login: "admin", orgId: 1 } },
+    "POST /api/user/using/2": { body: { message: "ok" } },
+    "GET /api/datasources": { body: [] },
+    "POST /api/user/using/1": { body: { message: "ok" } },
+  });
+  try {
+    const { context, writes } = stubContext();
+    await ensureDatasource({ ...dsArgs }, context);
+    // No create/update happened.
+    const mutating = mock.calls.filter((c) =>
+      c.method !== "GET" && !c.path.startsWith("/api/user/using/")
+    );
+    assertEquals(mutating.length, 0);
+    // Original org (1) restored after switching to 4.
+    assertEquals(mock.calls.some((c) => c.path === "/api/user/using/1"), true);
+    const w = writes[0].data;
+    assertEquals(w.existed, false);
+    assertEquals(w.mutated, false);
+    assertEquals(w.tenant, "acme");
+    assertEquals((w.plannedActions as string[]).length, 1);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("ensureDatasource confirm: creates with tenant header (name in jsonData, value in secureJsonData)", async () => {
+  const mock = installFetch({
+    "GET /api/user": { body: { login: "admin", orgId: 2 } },
+    "POST /api/user/using/2": { body: { message: "ok" } },
+    "GET /api/datasources": { body: [] },
+    "POST /api/datasources": {
+      body: { datasource: { uid: "ds-acme-mimir", name: "Mimir (acme)" } },
+    },
+  });
+  try {
+    const { context, writes } = stubContext();
+    await ensureDatasource({ ...dsArgs, confirm: true }, context);
+    const post = mock.calls.find((c) =>
+      c.method === "POST" && c.path === "/api/datasources"
+    );
+    const body = post?.body as {
+      type: string;
+      access: string;
+      jsonData: Record<string, string>;
+      secureJsonData: Record<string, string>;
+    };
+    assertEquals(body.type, "prometheus");
+    assertEquals(body.access, "proxy");
+    // The header NAME is in jsonData; the tenant VALUE only in secureJsonData.
+    assertEquals(body.jsonData.httpHeaderName1, "X-Scope-OrgID");
+    assertEquals(body.secureJsonData.httpHeaderValue1, "acme");
+    const w = writes[0].data;
+    assertEquals(w.mutated, true);
+    assertEquals(w.uid, "ds-acme-mimir");
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("ensureDatasource confirm: updates existing in place (PUT by uid), no duplicate, preserves jsonData", async () => {
+  const mock = installFetch({
+    "GET /api/user": { body: { login: "admin", orgId: 2 } },
+    "POST /api/user/using/2": { body: { message: "ok" } },
+    "GET /api/datasources": {
+      body: [{
+        id: 2,
+        uid: "ds-existing",
+        name: "Mimir (acme)",
+        type: "prometheus",
+        url: "https://old.example",
+        jsonData: { timeInterval: "30s" },
+      }],
+    },
+    "PUT /api/datasources/uid/ds-existing": { body: { datasource: { uid: "ds-existing" } } },
+  });
+  try {
+    const { context, writes } = stubContext();
+    await ensureDatasource({ ...dsArgs, confirm: true }, context);
+    // No POST-create — updated in place.
+    assertEquals(
+      mock.calls.some((c) =>
+        c.method === "POST" && c.path === "/api/datasources"
+      ),
+      false,
+    );
+    const put = mock.calls.find((c) => c.method === "PUT");
+    assertEquals(put?.path, "/api/datasources/uid/ds-existing");
+    const body = put?.body as { jsonData: Record<string, string> };
+    // url updated, out-of-band jsonData key preserved, header name set.
+    assertEquals((put?.body as { url: string }).url, "https://ingest.example.com");
+    assertEquals(body.jsonData.timeInterval, "30s");
+    assertEquals(body.jsonData.httpHeaderName1, "X-Scope-OrgID");
+    assertEquals(writes[0].data.existed, true);
+    assertEquals(writes[0].data.uid, "ds-existing");
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("ensureDatasource: empty url is rejected", async () => {
+  const { context } = stubContext();
+  await assertRejects(
+    () => ensureDatasource({ ...dsArgs, url: "" }, context),
+    Error,
+    "url is required",
   );
 });

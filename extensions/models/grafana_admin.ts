@@ -167,6 +167,59 @@ const OrgsSchema = z.object({
   listedAt: z.iso.datetime(),
 });
 
+// State + plan for an ensured Grafana org (created by name when absent). An org
+// is the query-side tenant boundary: its datasources carry the X-Scope-OrgID
+// that scopes Mimir/Loki reads, so a dedicated org per tenant keeps one
+// tenant's dashboards from reading another's series.
+const EnsuredOrgSchema = z.object({
+  grafanaUrl: z.string(),
+  name: z.string(),
+  orgId: z.number().optional().describe(
+    "Grafana org id (present once the org exists)",
+  ),
+  existed: z.boolean().describe(
+    "Whether an org of this name existed before this run",
+  ),
+  mutated: z.boolean().describe(
+    "Whether this run changed Grafana (confirm:true)",
+  ),
+  plannedActions: z
+    .array(z.string())
+    .describe("Actions this run would (dry-run) or did (confirm) take"),
+  ensuredAt: z.iso.datetime(),
+});
+
+// State + plan for an ensured datasource in a given org. Idempotent by (orgId,
+// name): an existing datasource of the same name is updated in place (PUT by
+// uid), never duplicated. The tenant header (X-Scope-OrgID) is injected
+// server-side by Grafana's proxy — its NAME in jsonData, its VALUE in
+// secureJsonData — so an org Viewer can neither read the value nor forge a
+// different tenant's id on this datasource.
+const DatasourceSchema = z.object({
+  grafanaUrl: z.string(),
+  orgId: z.number(),
+  name: z.string(),
+  dsType: z.string().describe("Grafana datasource type (prometheus | loki)"),
+  url: z.string(),
+  tenant: z.string().describe(
+    "X-Scope-OrgID value this datasource scopes reads to (empty = no tenant header)",
+  ),
+  isDefault: z.boolean(),
+  uid: z.string().optional().describe(
+    "Grafana-assigned uid (present once the datasource exists)",
+  ),
+  existed: z.boolean().describe(
+    "Whether a datasource of this name existed before this run",
+  ),
+  mutated: z.boolean().describe(
+    "Whether this run changed Grafana (confirm:true)",
+  ),
+  plannedActions: z
+    .array(z.string())
+    .describe("Actions this run would (dry-run) or did (confirm) take"),
+  ensuredAt: z.iso.datetime(),
+});
+
 // --- Execute context --------------------------------------------------------
 
 interface ExecuteContext {
@@ -441,8 +494,15 @@ export async function configureWebhookContactPoint(
   context: ExecuteContext,
 ): Promise<ExecuteResult> {
   const cfg = context.globalArgs;
-  const { orgId, name, url, httpMethod, disableResolveMessage, title, message } =
-    args;
+  const {
+    orgId,
+    name,
+    url,
+    httpMethod,
+    disableResolveMessage,
+    title,
+    message,
+  } = args;
   const { confirm } = args;
   if (!name) throw new Error("name is required");
   if (!url) throw new Error("url is required");
@@ -566,7 +626,11 @@ export async function configureWebhookContactPoint(
   } finally {
     if (originalOrg !== undefined && originalOrg !== orgId) {
       try {
-        await grafanaAdminRequest(cfg, "POST", `/api/user/using/${originalOrg}`);
+        await grafanaAdminRequest(
+          cfg,
+          "POST",
+          `/api/user/using/${originalOrg}`,
+        );
       } catch (_e) { /* best-effort restore */ }
     }
   }
@@ -635,16 +699,20 @@ export async function ensureFolder(
           `[ensureFolder] DRY RUN — re-run with confirm:true to create`,
         );
       }
-      const handle = await context.writeResource("folder", `${orgId}-${title}`, {
-        grafanaUrl: cfg.grafanaUrl,
-        orgId,
-        title,
-        uid: existing?.uid ?? (desiredUid || undefined),
-        existed: !!existing,
-        mutated: false,
-        plannedActions,
-        ensuredAt: new Date().toISOString(),
-      });
+      const handle = await context.writeResource(
+        "folder",
+        `${orgId}-${title}`,
+        {
+          grafanaUrl: cfg.grafanaUrl,
+          orgId,
+          title,
+          uid: existing?.uid ?? (desiredUid || undefined),
+          existed: !!existing,
+          mutated: false,
+          plannedActions,
+          ensuredAt: new Date().toISOString(),
+        },
+      );
       return { dataHandles: [handle] };
     }
 
@@ -673,7 +741,11 @@ export async function ensureFolder(
   } finally {
     if (originalOrg !== undefined && originalOrg !== orgId) {
       try {
-        await grafanaAdminRequest(cfg, "POST", `/api/user/using/${originalOrg}`);
+        await grafanaAdminRequest(
+          cfg,
+          "POST",
+          `/api/user/using/${originalOrg}`,
+        );
       } catch (_e) { /* best-effort restore */ }
     }
   }
@@ -714,6 +786,254 @@ export async function listOrgs(
   return { dataHandles: [handle] };
 }
 
+interface EnsureOrgArgs {
+  name: string;
+  confirm: boolean;
+}
+
+/**
+ * Core of `ensureOrg`, extracted so tests can drive it directly. Ensures a
+ * Grafana org of `name` exists and returns its id. Org CRUD is server-admin
+ * global, so there is no org switch. Idempotent — matched by name against
+ * `GET /api/orgs`, created only when absent. Dry-run unless `confirm`.
+ */
+export async function ensureOrg(
+  args: EnsureOrgArgs,
+  context: ExecuteContext,
+): Promise<ExecuteResult> {
+  const cfg = context.globalArgs;
+  const { name, confirm } = args;
+  if (!name) throw new Error("name is required");
+
+  const raw = (await grafanaAdminRequest(
+    cfg,
+    "GET",
+    "/api/orgs",
+  )) as unknown as OrgSummary[];
+  const existing = (raw ?? []).find((o) => o.name === name);
+
+  const plannedActions: string[] = [];
+  if (!existing) plannedActions.push(`create org '${name}'`);
+
+  console.log(
+    `[ensureOrg] ${cfg.grafanaUrl} name='${name}' existed=${!!existing} ` +
+      `confirm=${confirm}`,
+  );
+  for (const a of plannedActions) console.log(`  - ${a}`);
+  if (plannedActions.length === 0) {
+    console.log(`  (org already exists, id=${existing?.id})`);
+  }
+
+  // Dry run, or nothing to do (org already exists): report state, mutate nothing.
+  if (!confirm || existing) {
+    if (!confirm && !existing) {
+      console.log(`[ensureOrg] DRY RUN — re-run with confirm:true to create`);
+    }
+    const handle = await context.writeResource("org", name, {
+      grafanaUrl: cfg.grafanaUrl,
+      name,
+      orgId: existing?.id,
+      existed: !!existing,
+      mutated: false,
+      plannedActions,
+      ensuredAt: new Date().toISOString(),
+    });
+    return { dataHandles: [handle] };
+  }
+
+  const created = await grafanaAdminRequest(cfg, "POST", "/api/orgs", { name });
+  const orgId = created.orgId as number | undefined;
+  console.log(`[ensureOrg] created org '${name}' id=${orgId}`);
+
+  const handle = await context.writeResource("org", name, {
+    grafanaUrl: cfg.grafanaUrl,
+    name,
+    orgId,
+    existed: false,
+    mutated: true,
+    plannedActions,
+    ensuredAt: new Date().toISOString(),
+  });
+  return { dataHandles: [handle] };
+}
+
+interface EnsureDatasourceArgs {
+  orgId: number;
+  name: string;
+  dsType: "prometheus" | "loki";
+  url: string;
+  tenant: string;
+  isDefault: boolean;
+  confirm: boolean;
+}
+
+interface DatasourceSummary {
+  id?: number;
+  uid?: string;
+  name?: string;
+  type?: string;
+  url?: string;
+  jsonData?: Record<string, unknown>;
+  isDefault?: boolean;
+}
+
+/**
+ * Core of `ensureDatasource`, extracted so tests can drive it directly. Ensures
+ * a proxy-access datasource (`dsType` = prometheus | loki) named `name` exists
+ * in `orgId`, pointing at `url`, with the tenant header injected server-side:
+ * `X-Scope-OrgID` as httpHeaderName1 in jsonData and its value `tenant` in
+ * secureJsonData (which Grafana never returns on GET, so it is always re-sent).
+ * This is the query-side tenant wall: the value lives in secureJsonData so an
+ * org Viewer can neither read it nor forge a different tenant's id on this
+ * datasource. Idempotent by (orgId, name): an existing datasource is updated in
+ * place (PUT by uid), never duplicated, and its other jsonData keys are
+ * preserved. Dry-run unless `confirm`. The admin's active org is switched for
+ * the operation and always restored in the `finally`.
+ */
+export async function ensureDatasource(
+  args: EnsureDatasourceArgs,
+  context: ExecuteContext,
+): Promise<ExecuteResult> {
+  const cfg = context.globalArgs;
+  const { orgId, name, dsType, url, tenant, isDefault, confirm } = args;
+  if (!name) throw new Error("name is required");
+  if (!url) throw new Error("url is required");
+
+  const me = await grafanaAdminRequest(cfg, "GET", "/api/user");
+  const originalOrg = typeof me.orgId === "number" ? me.orgId : undefined;
+
+  try {
+    await grafanaAdminRequest(cfg, "POST", `/api/user/using/${orgId}`);
+
+    const list = (await grafanaAdminRequest(
+      cfg,
+      "GET",
+      "/api/datasources",
+    )) as unknown as DatasourceSummary[];
+    const existing = (list ?? []).find((d) => d.name === name);
+
+    // Tenant header: the NAME lives in jsonData, the VALUE in secureJsonData.
+    // Merge onto any existing jsonData so out-of-band keys survive; only
+    // httpHeaderName1 is owned here. The value is always re-sent because
+    // Grafana does not return secureJsonData on GET.
+    const jsonData: Record<string, unknown> = { ...(existing?.jsonData ?? {}) };
+    const secureJsonData: Record<string, unknown> = {};
+    if (tenant) {
+      jsonData.httpHeaderName1 = "X-Scope-OrgID";
+      secureJsonData.httpHeaderValue1 = tenant;
+    }
+
+    const body: Record<string, unknown> = {
+      name,
+      type: dsType,
+      access: "proxy",
+      url,
+      isDefault,
+      jsonData,
+      ...(tenant ? { secureJsonData } : {}),
+    };
+
+    const plannedActions: string[] = [];
+    if (!existing) {
+      plannedActions.push(
+        `create ${dsType} datasource '${name}' -> ${url}` +
+          (tenant ? ` (X-Scope-OrgID=${tenant})` : ""),
+      );
+    } else {
+      plannedActions.push(
+        `update ${dsType} datasource '${name}' (uid ${existing.uid}) -> ${url}` +
+          (tenant ? ` (X-Scope-OrgID=${tenant})` : ""),
+      );
+    }
+
+    console.log(
+      `[ensureDatasource] org=${orgId} name='${name}' type=${dsType} ` +
+        `existed=${!!existing} confirm=${confirm}`,
+    );
+    for (const a of plannedActions) console.log(`  - ${a}`);
+
+    if (!confirm) {
+      console.log(
+        `[ensureDatasource] DRY RUN — re-run with confirm:true to apply`,
+      );
+      const handle = await context.writeResource(
+        "datasource",
+        `${orgId}-${name}`,
+        {
+          grafanaUrl: cfg.grafanaUrl,
+          orgId,
+          name,
+          dsType,
+          url,
+          tenant,
+          isDefault,
+          uid: existing?.uid,
+          existed: !!existing,
+          mutated: false,
+          plannedActions,
+          ensuredAt: new Date().toISOString(),
+        },
+      );
+      return { dataHandles: [handle] };
+    }
+
+    let uid = existing?.uid;
+    if (!existing) {
+      const created = await grafanaAdminRequest(
+        cfg,
+        "POST",
+        "/api/datasources",
+        body,
+      );
+      // POST /api/datasources returns the created row either at top level or
+      // nested under `datasource` across Grafana versions; read uid from the
+      // nested object when present.
+      const ds = (created.datasource as DatasourceSummary | undefined) ??
+        (created as DatasourceSummary);
+      uid = ds.uid;
+      console.log(`[ensureDatasource] created datasource uid=${uid}`);
+    } else {
+      await grafanaAdminRequest(
+        cfg,
+        "PUT",
+        `/api/datasources/uid/${existing.uid}`,
+        body,
+      );
+      console.log(`[ensureDatasource] updated datasource uid=${existing.uid}`);
+    }
+
+    const handle = await context.writeResource(
+      "datasource",
+      `${orgId}-${name}`,
+      {
+        grafanaUrl: cfg.grafanaUrl,
+        orgId,
+        name,
+        dsType,
+        url,
+        tenant,
+        isDefault,
+        uid,
+        existed: !!existing,
+        mutated: true,
+        plannedActions,
+        ensuredAt: new Date().toISOString(),
+      },
+    );
+    return { dataHandles: [handle] };
+  } finally {
+    if (originalOrg !== undefined && originalOrg !== orgId) {
+      try {
+        await grafanaAdminRequest(
+          cfg,
+          "POST",
+          `/api/user/using/${originalOrg}`,
+        );
+      } catch (_e) { /* best-effort restore */ }
+    }
+  }
+}
+
 // --- Model ------------------------------------------------------------------
 
 /**
@@ -724,9 +1044,9 @@ export async function listOrgs(
  */
 export const model = {
   type: "@shrug/grafana-admin/instance",
-  version: "2026.08.21.1",
+  version: "2026.11.16.1",
   description:
-    "Grafana control-plane over admin basic-auth: list orgs, and idempotently ensure a service account (and optionally mint its token), a webhook (e.g. ntfy) contact point, or a folder in a given org. Dry-run by default; confirm:true to apply.",
+    "Grafana control-plane over admin basic-auth: list orgs, idempotently ensure an org, a tenant-scoped datasource (X-Scope-OrgID in secureJsonData), a service account (and optionally mint its token), a webhook (e.g. ntfy) contact point, or a folder. Dry-run by default; confirm:true to apply.",
   globalArguments: GlobalArgsSchema,
   resources: {
     "serviceAccount": {
@@ -744,7 +1064,8 @@ export const model = {
       garbageCollection: 50,
     },
     "folder": {
-      description: "State + plan for an ensured Grafana folder (returns its uid)",
+      description:
+        "State + plan for an ensured Grafana folder (returns its uid)",
       schema: FolderSchema,
       lifetime: "infinite",
       garbageCollection: 50,
@@ -756,6 +1077,20 @@ export const model = {
       lifetime: "1h",
       garbageCollection: 10,
     },
+    "org": {
+      description:
+        "State + plan for an ensured org (created by name when absent; returns its id)",
+      schema: EnsuredOrgSchema,
+      lifetime: "infinite",
+      garbageCollection: 50,
+    },
+    "datasource": {
+      description:
+        "State + plan for an ensured datasource in an org (tenant header in secureJsonData)",
+      schema: DatasourceSchema,
+      lifetime: "infinite",
+      garbageCollection: 50,
+    },
   },
   methods: {
     listOrgs: {
@@ -766,6 +1101,67 @@ export const model = {
         _args: Record<string, never>,
         context: ExecuteContext,
       ): Promise<ExecuteResult> => listOrgs(context),
+    },
+    ensureOrg: {
+      description:
+        "Idempotently ensure a Grafana org of the given name exists and return its id (org CRUD is server-admin global). Dry-run unless confirm:true; matched by name, created only when absent. A dedicated org per tenant is the query-side tenant boundary.",
+      arguments: z.object({
+        name: z.string().describe(
+          "Org name (match key for idempotency), e.g. AcmeCorp",
+        ),
+        confirm: z
+          .boolean()
+          .default(false)
+          .describe("Must be true to create — otherwise a read-only dry run"),
+      }),
+      execute: (
+        args: { name: string; confirm: boolean },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => ensureOrg(args, context),
+    },
+    ensureDatasource: {
+      description:
+        "Idempotently ensure a proxy-access datasource (prometheus | loki) exists in an org, pointing at url, with the X-Scope-OrgID tenant header injected server-side (value stored in secureJsonData so org Viewers cannot read or forge it). Dry-run unless confirm:true; matched by name within the org, updated in place (never duplicated).",
+      arguments: z.object({
+        orgId: z.number().describe(
+          "Target Grafana org id the datasource belongs to",
+        ),
+        name: z.string().describe(
+          "Datasource name (match key for idempotency within the org)",
+        ),
+        dsType: z
+          .enum(["prometheus", "loki"])
+          .describe("Grafana datasource type"),
+        url: z.string().describe(
+          "Backend URL Grafana proxies to (e.g. the Mimir/Loki query endpoint)",
+        ),
+        tenant: z
+          .string()
+          .default("")
+          .describe(
+            "X-Scope-OrgID value to scope reads to (e.g. acme); empty = no tenant header",
+          ),
+        isDefault: z
+          .boolean()
+          .default(false)
+          .describe("Mark this the org's default datasource"),
+        confirm: z
+          .boolean()
+          .default(false)
+          .describe("Must be true to apply — otherwise a read-only dry run"),
+      }),
+      execute: (
+        args: {
+          orgId: number;
+          name: string;
+          dsType: "prometheus" | "loki";
+          url: string;
+          tenant: string;
+          isDefault: boolean;
+          confirm: boolean;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => ensureDatasource(args, context),
     },
     ensureServiceAccount: {
       description:
