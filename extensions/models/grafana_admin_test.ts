@@ -21,6 +21,7 @@ import {
   ensureOrg,
   ensureServiceAccount,
   listOrgs,
+  model,
 } from "./grafana_admin.ts";
 
 type Reply = { status?: number; body?: unknown };
@@ -85,7 +86,11 @@ function stubContext() {
       adminUser: "admin",
       adminPassword: "secret",
     },
-    writeResource: (spec: string, name: string, data: Record<string, unknown>) => {
+    writeResource: (
+      spec: string,
+      name: string,
+      data: Record<string, unknown>,
+    ) => {
       writes.push({ spec, name, data });
       return Promise.resolve({ name });
     },
@@ -168,20 +173,30 @@ Deno.test("confirm: creates the SA when absent", async () => {
     "POST /api/user/using/1": { body: { message: "ok" } },
     "GET /api/serviceaccounts/search": { body: { serviceAccounts: [] } },
     "POST /api/serviceaccounts": {
-      body: { id: 7, name: "admin-dashboards", login: "sa-1-admin-dashboards", role: "Editor" },
+      body: {
+        id: 7,
+        name: "admin-dashboards",
+        login: "sa-1-admin-dashboards",
+        role: "Editor",
+      },
     },
   });
   try {
     const { context, writes } = stubContext();
     await ensureServiceAccount({ ...baseArgs, confirm: true }, context);
-    const post = mock.calls.find((c) => c.method === "POST" && c.path === "/api/serviceaccounts");
+    const post = mock.calls.find((c) =>
+      c.method === "POST" && c.path === "/api/serviceaccounts"
+    );
     assertEquals(post?.body, { name: "admin-dashboards", role: "Editor" });
     const w = writes[0].data;
     assertEquals(w.mutated, true);
     assertEquals(w.existed, false);
     assertEquals(w.saId, 7);
     // No org restore call needed (already in org 1).
-    assertEquals(mock.calls.filter((c) => c.path.startsWith("/api/user/using/")).length, 1);
+    assertEquals(
+      mock.calls.filter((c) => c.path.startsWith("/api/user/using/")).length,
+      1,
+    );
   } finally {
     mock.restore();
   }
@@ -192,7 +207,14 @@ Deno.test("confirm: patches role when it differs, no create", async () => {
     "GET /api/user": { body: { login: "admin", orgId: 1 } },
     "POST /api/user/using/1": { body: { message: "ok" } },
     "GET /api/serviceaccounts/search": {
-      body: { serviceAccounts: [{ id: 5, name: "admin-dashboards", login: "l", role: "Viewer" }] },
+      body: {
+        serviceAccounts: [{
+          id: 5,
+          name: "admin-dashboards",
+          login: "l",
+          role: "Viewer",
+        }],
+      },
     },
     "PATCH /api/serviceaccounts/5": { body: { id: 5, role: "Editor" } },
   });
@@ -200,7 +222,9 @@ Deno.test("confirm: patches role when it differs, no create", async () => {
     const { context, writes } = stubContext();
     await ensureServiceAccount({ ...baseArgs, confirm: true }, context);
     assertEquals(
-      mock.calls.some((c) => c.method === "POST" && c.path === "/api/serviceaccounts"),
+      mock.calls.some((c) =>
+        c.method === "POST" && c.path === "/api/serviceaccounts"
+      ),
       false,
     );
     const patch = mock.calls.find((c) => c.method === "PATCH");
@@ -217,15 +241,29 @@ Deno.test("confirm + mintToken: mints token, secret never persisted", async () =
     "GET /api/user": { body: { login: "admin", orgId: 1 } },
     "POST /api/user/using/1": { body: { message: "ok" } },
     "GET /api/serviceaccounts/search": {
-      body: { serviceAccounts: [{ id: 9, name: "admin-dashboards", login: "l", role: "Editor" }] },
+      body: {
+        serviceAccounts: [{
+          id: 9,
+          name: "admin-dashboards",
+          login: "l",
+          role: "Editor",
+        }],
+      },
     },
     "GET /api/serviceaccounts/9/tokens": { body: [] },
-    "POST /api/serviceaccounts/9/tokens": { body: { id: 42, name: "admin-dashboards-token", key: "glsa_SUPERSECRET" } },
+    "POST /api/serviceaccounts/9/tokens": {
+      body: { id: 42, name: "admin-dashboards-token", key: "glsa_SUPERSECRET" },
+    },
   });
   try {
     const { context, writes } = stubContext();
-    await ensureServiceAccount({ ...baseArgs, mintToken: true, confirm: true }, context);
-    const mint = mock.calls.find((c) => c.method === "POST" && c.path === "/api/serviceaccounts/9/tokens");
+    await ensureServiceAccount(
+      { ...baseArgs, mintToken: true, confirm: true },
+      context,
+    );
+    const mint = mock.calls.find((c) =>
+      c.method === "POST" && c.path === "/api/serviceaccounts/9/tokens"
+    );
     assertEquals(mint?.body, { name: "admin-dashboards-token" });
     const w = writes[0].data;
     assertEquals(w.tokenMinted, true);
@@ -242,7 +280,14 @@ Deno.test("mintToken idempotent: existing token not re-minted without force", as
     "GET /api/user": { body: { login: "admin", orgId: 1 } },
     "POST /api/user/using/1": { body: { message: "ok" } },
     "GET /api/serviceaccounts/search": {
-      body: { serviceAccounts: [{ id: 9, name: "admin-dashboards", login: "l", role: "Editor" }] },
+      body: {
+        serviceAccounts: [{
+          id: 9,
+          name: "admin-dashboards",
+          login: "l",
+          role: "Editor",
+        }],
+      },
     },
     "GET /api/serviceaccounts/9/tokens": {
       body: [{ id: 42, name: "admin-dashboards-token" }],
@@ -250,7 +295,10 @@ Deno.test("mintToken idempotent: existing token not re-minted without force", as
   });
   try {
     const { context, writes } = stubContext();
-    await ensureServiceAccount({ ...baseArgs, mintToken: true, confirm: true }, context);
+    await ensureServiceAccount(
+      { ...baseArgs, mintToken: true, confirm: true },
+      context,
+    );
     assertEquals(
       mock.calls.some((c) => c.method === "POST" && c.path.endsWith("/tokens")),
       false,
@@ -266,13 +314,22 @@ Deno.test("mintToken force: rotates (deletes then recreates) the token", async (
     "GET /api/user": { body: { login: "admin", orgId: 1 } },
     "POST /api/user/using/1": { body: { message: "ok" } },
     "GET /api/serviceaccounts/search": {
-      body: { serviceAccounts: [{ id: 9, name: "admin-dashboards", login: "l", role: "Editor" }] },
+      body: {
+        serviceAccounts: [{
+          id: 9,
+          name: "admin-dashboards",
+          login: "l",
+          role: "Editor",
+        }],
+      },
     },
     "GET /api/serviceaccounts/9/tokens": {
       body: [{ id: 42, name: "admin-dashboards-token" }],
     },
     "DELETE /api/serviceaccounts/9/tokens/42": { body: { message: "deleted" } },
-    "POST /api/serviceaccounts/9/tokens": { body: { id: 43, name: "admin-dashboards-token", key: "glsa_NEW" } },
+    "POST /api/serviceaccounts/9/tokens": {
+      body: { id: 43, name: "admin-dashboards-token", key: "glsa_NEW" },
+    },
   });
   try {
     const { context, writes } = stubContext();
@@ -502,7 +559,9 @@ Deno.test("ensureFolder confirm: creates when absent and returns new uid", async
     "GET /api/user": { body: { login: "admin", orgId: 1 } },
     "POST /api/user/using/1": { body: { message: "ok" } },
     "GET /api/folders": { body: [] },
-    "POST /api/folders": { body: { uid: "folder-new", title: "Bed Host Health" } },
+    "POST /api/folders": {
+      body: { uid: "folder-new", title: "Bed Host Health" },
+    },
   });
   try {
     const { context, writes } = stubContext();
@@ -696,7 +755,9 @@ Deno.test("ensureDatasource confirm: updates existing in place (PUT by uid), no 
         jsonData: { timeInterval: "30s" },
       }],
     },
-    "PUT /api/datasources/uid/ds-existing": { body: { datasource: { uid: "ds-existing" } } },
+    "PUT /api/datasources/uid/ds-existing": {
+      body: { datasource: { uid: "ds-existing" } },
+    },
   });
   try {
     const { context, writes } = stubContext();
@@ -712,7 +773,10 @@ Deno.test("ensureDatasource confirm: updates existing in place (PUT by uid), no 
     assertEquals(put?.path, "/api/datasources/uid/ds-existing");
     const body = put?.body as { jsonData: Record<string, string> };
     // url updated, out-of-band jsonData key preserved, header name set.
-    assertEquals((put?.body as { url: string }).url, "https://ingest.example.com");
+    assertEquals(
+      (put?.body as { url: string }).url,
+      "https://ingest.example.com",
+    );
     assertEquals(body.jsonData.timeInterval, "30s");
     assertEquals(body.jsonData.httpHeaderName1, "X-Scope-OrgID");
     assertEquals(writes[0].data.existed, true);
@@ -729,4 +793,109 @@ Deno.test("ensureDatasource: empty url is rejected", async () => {
     Error,
     "url is required",
   );
+});
+
+// --- preflight coverage + exhaustive lookups --------------------------------
+
+Deno.test("admin-authenticates check covers every mutating method", () => {
+  // deno-lint-ignore no-explicit-any
+  const applies = (model as any).checks["admin-authenticates"]
+    .appliesTo as string[];
+  for (
+    const m of [
+      "ensureServiceAccount",
+      "configureWebhookContactPoint",
+      "ensureFolder",
+      "ensureOrg",
+      "ensureDatasource",
+    ]
+  ) {
+    assertEquals(
+      applies.includes(m),
+      true,
+      `admin-authenticates must pre-check ${m}`,
+    );
+  }
+  // listOrgs is read-only discovery and is intentionally excluded.
+  assertEquals(applies.includes("listOrgs"), false);
+});
+
+Deno.test("ensureServiceAccount: pages search to match beyond the first page", async () => {
+  let searchCall = 0;
+  // A full first page (100) of non-matching SAs, then the real match on page 2.
+  const firstPage = Array.from({ length: 100 }, (_, i) => ({
+    id: i + 1,
+    name: `unrelated-${i}`,
+    login: "l",
+    role: "Viewer",
+  }));
+  const mock = installFetch({
+    "GET /api/user": { body: { login: "admin", orgId: 1 } },
+    "POST /api/user/using/1": { body: { message: "ok" } },
+    "GET /api/serviceaccounts/search": () => {
+      searchCall++;
+      return searchCall === 1 ? { body: { serviceAccounts: firstPage } } : {
+        body: {
+          serviceAccounts: [
+            { id: 999, name: "admin-dashboards", login: "l", role: "Editor" },
+          ],
+        },
+      };
+    },
+  });
+  try {
+    const { context, writes } = stubContext();
+    await ensureServiceAccount({ ...baseArgs, confirm: true }, context);
+    // Found on page 2 -> treated as existing, so no create POST.
+    assertEquals(
+      mock.calls.some((c) =>
+        c.method === "POST" && c.path === "/api/serviceaccounts"
+      ),
+      false,
+    );
+    assertEquals(writes[0].data.existed, true);
+    assertEquals(writes[0].data.saId, 999);
+    // Both search pages were fetched (full first page forced a second).
+    assertEquals(
+      mock.calls.filter((c) => c.path === "/api/serviceaccounts/search").length,
+      2,
+    );
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("ensureFolder: pages folder list to match beyond the first page", async () => {
+  let folderCall = 0;
+  const firstPage = Array.from({ length: 1000 }, (_, i) => ({
+    uid: `f-${i}`,
+    title: `Folder ${i}`,
+  }));
+  const mock = installFetch({
+    "GET /api/user": { body: { login: "admin", orgId: 1 } },
+    "POST /api/user/using/1": { body: { message: "ok" } },
+    "GET /api/folders": () => {
+      folderCall++;
+      return folderCall === 1
+        ? { body: firstPage }
+        : { body: [{ uid: "folder-target", title: "Bed Host Health" }] };
+    },
+  });
+  try {
+    const { context, writes } = stubContext();
+    await ensureFolder({ ...folderArgs, confirm: true }, context);
+    // Match on page 2 -> existing, no create POST.
+    assertEquals(
+      mock.calls.some((c) => c.method === "POST" && c.path === "/api/folders"),
+      false,
+    );
+    assertEquals(writes[0].data.existed, true);
+    assertEquals(writes[0].data.uid, "folder-target");
+    assertEquals(
+      mock.calls.filter((c) => c.path === "/api/folders").length,
+      2,
+    );
+  } finally {
+    mock.restore();
+  }
 });

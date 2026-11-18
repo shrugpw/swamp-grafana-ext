@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@shrug/grafana-ext"
-version: "2026.11.18.1"
+version: "2026.11.18.2"
 description: "Grafana swamp-native gaps: a control-plane admin model (idempotent ensureServiceAccount over basic-auth) plus a queryLogs extension that adds LogQL/Loki reads to @keeb/grafana/instance alongside its queryMetrics."
 
 repository: https://github.com/shrugpw/swamp-grafana-ext

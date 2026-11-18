@@ -10,7 +10,11 @@
  *
  * @module
  */
-import { assertAlmostEquals, assertEquals, assertRejects } from "jsr:@std/assert@1";
+import {
+  assertAlmostEquals,
+  assertEquals,
+  assertRejects,
+} from "jsr:@std/assert@1";
 import { queryLogs, resolveTime } from "./grafana_logs.ts";
 
 // --- Pure helper ------------------------------------------------------------
@@ -60,14 +64,28 @@ function installFetch(handlers: Record<string, Reply>): {
       new Response(text, { status, statusText: status < 300 ? "OK" : "Error" }),
     );
   }) as typeof fetch;
-  return { restore: () => { globalThis.fetch = original; }, calls };
+  return {
+    restore: () => {
+      globalThis.fetch = original;
+    },
+    calls,
+  };
 }
 
 function stubContext() {
-  const writes: Array<{ spec: string; name: string; data: Record<string, unknown> }> = [];
+  const writes: Array<
+    { spec: string; name: string; data: Record<string, unknown> }
+  > = [];
   const context = {
-    globalArgs: { grafanaUrl: "https://grafana.example.com", apiKey: "sa-token" },
-    writeResource: (spec: string, name: string, data: Record<string, unknown>) => {
+    globalArgs: {
+      grafanaUrl: "https://grafana.example.com",
+      apiKey: "sa-token",
+    },
+    writeResource: (
+      spec: string,
+      name: string,
+      data: Record<string, unknown>,
+    ) => {
       writes.push({ spec, name, data });
       return Promise.resolve({ name });
     },
@@ -101,7 +119,10 @@ Deno.test("queryLogs proxies to the Loki DS and snapshots streams/lines", async 
           result: [
             {
               stream: { service_name: "mimir", level: "error" },
-              values: [["1783728000000000000", "boom"], ["1783728001000000000", "kaput"]],
+              values: [["1783728000000000000", "boom"], [
+                "1783728001000000000",
+                "kaput",
+              ]],
             },
           ],
         },
@@ -112,8 +133,13 @@ Deno.test("queryLogs proxies to the Loki DS and snapshots streams/lines", async 
     const { context, writes } = stubContext();
     const res = await queryLogs({ ...logsArgs }, context);
     // Proxy path uses the Loki DS id (2), not the prometheus one.
-    const proxy = mock.calls.find((c) => c.path.includes("/loki/api/v1/query_range"));
-    assertEquals(proxy?.path, "/api/datasources/proxy/2/loki/api/v1/query_range");
+    const proxy = mock.calls.find((c) =>
+      c.path.includes("/loki/api/v1/query_range")
+    );
+    assertEquals(
+      proxy?.path,
+      "/api/datasources/proxy/2/loki/api/v1/query_range",
+    );
     // Window is expressed in nanoseconds; LogQL is URL-encoded (a space -> %20 or +).
     assertEquals(/start=\d+000000000/.test(proxy!.search), true);
     assertEquals(/end=\d+000000000/.test(proxy!.search), true);
@@ -145,8 +171,13 @@ Deno.test("queryLogs disambiguates by datasourceName", async () => {
   try {
     const { context } = stubContext();
     await queryLogs({ ...logsArgs, datasourceName: "Loki-bed" }, context);
-    const proxy = mock.calls.find((c) => c.path.includes("/loki/api/v1/query_range"));
-    assertEquals(proxy?.path, "/api/datasources/proxy/3/loki/api/v1/query_range");
+    const proxy = mock.calls.find((c) =>
+      c.path.includes("/loki/api/v1/query_range")
+    );
+    assertEquals(
+      proxy?.path,
+      "/api/datasources/proxy/3/loki/api/v1/query_range",
+    );
   } finally {
     mock.restore();
   }
@@ -154,7 +185,9 @@ Deno.test("queryLogs disambiguates by datasourceName", async () => {
 
 Deno.test("queryLogs throws when no Loki datasource exists", async () => {
   const mock = installFetch({
-    "GET /api/datasources": { body: [{ id: 1, name: "Mimir", type: "prometheus" }] },
+    "GET /api/datasources": {
+      body: [{ id: 1, name: "Mimir", type: "prometheus" }],
+    },
   });
   try {
     const { context } = stubContext();

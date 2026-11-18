@@ -3,13 +3,13 @@
 Two swamp-native fills for gaps the community
 [`@keeb/grafana`](https://github.com/keeb/swamp-grafana) model leaves open:
 
-1. **`@shrug/grafana-admin/instance`** — Grafana *control-plane* over server
+1. **`@shrug/grafana-admin/instance`** -- Grafana *control-plane* over server
    **admin basic-auth**. `ensureServiceAccount` idempotently creates (or
    role-patches) a service account in a given org and optionally mints its API
    token. A `@keeb/grafana` SA token is org-scoped and can't create *other*
    SAs, so bootstrapping dashboard-push service accounts otherwise means a
-   one-off `curl` against the admin API — this replaces it.
-2. **`queryLogs`** (an `export const extension` on `@keeb/grafana/instance`) —
+   one-off `curl` against the admin API -- this replaces it.
+2. **`queryLogs`** (an `export const extension` on `@keeb/grafana/instance`) --
    the Loki sibling of the model's `queryMetrics`. Same Bearer SA token, same
    datasource-proxy pattern, LogQL instead of PromQL. Keeps "swamp-native reads"
    whole: metrics *and* logs off the one instance model.
@@ -20,7 +20,7 @@ Two swamp-native fills for gaps the community
 
 ## ensureServiceAccount
 
-Dry-run by default — it reports the plan and mutates nothing until
+Dry-run by default -- it reports the plan and mutates nothing until
 `confirm:true`. Minting a token is a second opt-in (`mintToken:true`); the
 secret is printed to the run log **once** (Grafana never reveals it again) and
 is deliberately not persisted in swamp data.
@@ -31,7 +31,7 @@ swamp model create @shrug/grafana-admin/instance grafana-admin \
   --global-arg 'grafanaUrl=https://grafana.example.com' \
   --global-arg 'adminPassword=${{ vault.get("<vault>", "grafana/admin-password") }}'
 
-# Dry run — what would happen?
+# Dry run -- what would happen?
 swamp model method run grafana-admin ensureServiceAccount \
   --input orgId:json=1 --input name=dashboards --input role=Editor
 
@@ -49,17 +49,17 @@ afterward.
 
 | Argument     | Default        | Meaning                                             |
 | ------------ | -------------- | --------------------------------------------------- |
-| `orgId`      | —              | Target org id (e.g. 1 = Main Org.)                  |
-| `name`       | —              | Service account name (idempotency match key)        |
+| `orgId`      | --              | Target org id (e.g. 1 = Main Org.)                  |
+| `name`       | --              | Service account name (idempotency match key)        |
 | `role`       | `Editor`       | `Viewer` \| `Editor` \| `Admin`                     |
 | `mintToken`  | `false`        | Also mint an API token (secret printed once)        |
 | `tokenName`  | `<name>-token` | Token name                                          |
 | `force`      | `false`        | Rotate an existing token of `tokenName`             |
-| `confirm`    | `false`        | Must be true to apply — otherwise a read-only plan  |
+| `confirm`    | `false`        | Must be true to apply -- otherwise a read-only plan  |
 
 ## queryLogs
 
-Merges into the existing `@keeb/grafana/instance` type — use it on any instance
+Merges into the existing `@keeb/grafana/instance` type -- use it on any instance
 of that model:
 
 ```bash
@@ -74,7 +74,7 @@ raw result into a `logResult` resource.
 
 | Argument         | Default    | Meaning                                    |
 | ---------------- | ---------- | ------------------------------------------ |
-| `query`          | —          | LogQL query string                         |
+| `query`          | --          | LogQL query string                         |
 | `start`          | `1h`       | Range start (ISO8601 or relative `15m`)    |
 | `end`            | now        | Range end (ISO8601 or relative)            |
 | `limit`          | `100`      | Max log lines                              |
@@ -89,4 +89,4 @@ deno test extensions/models/
 
 ## License
 
-MIT © Neil Hanlon
+MIT (c) Neil Hanlon

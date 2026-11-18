@@ -1,5 +1,5 @@
 /**
- * @shrug/grafana-admin — Grafana *control-plane* operations that a data-plane
+ * @shrug/grafana-admin -- Grafana *control-plane* operations that a data-plane
  * service-account token cannot perform.
  *
  * The community `@keeb/grafana/instance` model authenticates with an org-scoped
@@ -7,12 +7,12 @@
  * inside one org, but a SA token is bound to a single org and lacks the
  * privilege to create *other* service accounts. Bootstrapping the service
  * accounts you push dashboards with therefore needs Grafana **admin basic-auth**
- * plus an org switch (`POST /api/user/using/{orgId}`) — which is exactly what
+ * plus an org switch (`POST /api/user/using/{orgId}`) -- which is exactly what
  * this model wraps, replacing the one-off `curl` admin-API bootstrap.
  *
  * `ensureServiceAccount` is idempotent and **dry-run by default**: without
  * `confirm:true` it only discovers the current state and reports the actions it
- * *would* take. Token minting is a deliberate second opt-in (`mintToken:true`) —
+ * *would* take. Token minting is a deliberate second opt-in (`mintToken:true`) --
  * the freshly minted secret is printed to the run log ONCE (Grafana never
  * reveals it again) and is intentionally NOT persisted in swamp data.
  *
@@ -39,7 +39,7 @@ const GlobalArgsSchema = z.object({
     .string()
     .meta({ sensitive: true })
     .describe(
-      "Grafana server-admin password — resolve from a vault via CEL, do not hard-code",
+      "Grafana server-admin password -- resolve from a vault via CEL, do not hard-code",
     ),
 });
 type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
@@ -73,12 +73,58 @@ async function grafanaAdminRequest(
   const text = await resp.text();
   if (!resp.ok) {
     throw new Error(
-      `Grafana ${method} ${path} failed: ${resp.status} ${resp.statusText} — ${
+      `Grafana ${method} ${path} failed: ${resp.status} ${resp.statusText} -- ${
         text.slice(0, 300)
       }`,
     );
   }
   return text ? JSON.parse(text) : {};
+}
+
+/**
+ * Page through GET /api/serviceaccounts/search for `name` until a short page,
+ * so the exact-name match is found even on instances whose query spans more
+ * than one page of service accounts.
+ */
+async function searchServiceAccounts(
+  cfg: GlobalArgs,
+  name: string,
+): Promise<SaSummary[]> {
+  const perpage = 100;
+  const all: SaSummary[] = [];
+  for (let page = 1;; page++) {
+    const search = await grafanaAdminRequest(
+      cfg,
+      "GET",
+      `/api/serviceaccounts/search?query=${
+        encodeURIComponent(name)
+      }&perpage=${perpage}&page=${page}`,
+    );
+    const batch = (search.serviceAccounts as SaSummary[] | undefined) ?? [];
+    all.push(...batch);
+    if (batch.length < perpage) break;
+  }
+  return all;
+}
+
+/**
+ * Page through GET /api/folders until a short page, so a folder match by title
+ * is found even past the first page on instances with many folders.
+ */
+async function listAllFolders(cfg: GlobalArgs): Promise<FolderSummary[]> {
+  const limit = 1000;
+  const all: FolderSummary[] = [];
+  for (let page = 1;; page++) {
+    const batch = (await grafanaAdminRequest(
+      cfg,
+      "GET",
+      `/api/folders?limit=${limit}&page=${page}`,
+    )) as unknown as FolderSummary[];
+    const arr = batch ?? [];
+    all.push(...arr);
+    if (arr.length < limit) break;
+  }
+  return all;
 }
 
 // --- Resource schema --------------------------------------------------------
@@ -192,8 +238,8 @@ const EnsuredOrgSchema = z.object({
 // State + plan for an ensured datasource in a given org. Idempotent by (orgId,
 // name): an existing datasource of the same name is updated in place (PUT by
 // uid), never duplicated. The tenant header (X-Scope-OrgID) is injected
-// server-side by Grafana's proxy — its NAME in jsonData, its VALUE in
-// secureJsonData — so an org Viewer can neither read the value nor forge a
+// server-side by Grafana's proxy -- its NAME in jsonData, its VALUE in
+// secureJsonData -- so an org Viewer can neither read the value nor forge a
 // different tenant's id on this datasource.
 const DatasourceSchema = z.object({
   grafanaUrl: z.string(),
@@ -260,7 +306,7 @@ interface TokenSummary {
 /**
  * Core of `ensureServiceAccount`, extracted so tests can drive it directly. It
  * switches to `orgId`, discovers the SA (and, when minting, its tokens), builds
- * a plan, and — only under `confirm` — applies create/patch/mint. The admin's
+ * a plan, and -- only under `confirm` -- applies create/patch/mint. The admin's
  * original active org is always restored in the `finally`.
  */
 export async function ensureServiceAccount(
@@ -277,14 +323,7 @@ export async function ensureServiceAccount(
   try {
     await grafanaAdminRequest(cfg, "POST", `/api/user/using/${orgId}`);
 
-    const search = await grafanaAdminRequest(
-      cfg,
-      "GET",
-      `/api/serviceaccounts/search?query=${
-        encodeURIComponent(name)
-      }&perpage=100`,
-    );
-    const list = (search.serviceAccounts as SaSummary[] | undefined) ?? [];
+    const list = await searchServiceAccounts(cfg, name);
     const existing = list.find((sa) => sa.name === name);
 
     // Discover an existing token of tokenName (only relevant when minting).
@@ -311,7 +350,7 @@ export async function ensureServiceAccount(
       if (existingToken && !force) {
         console.log(
           `[ensureServiceAccount] token '${tokenName}' already exists (id ${existingToken.id}); ` +
-            `its secret is not retrievable — pass force:true to rotate it.`,
+            `its secret is not retrievable -- pass force:true to rotate it.`,
         );
       } else if (existingToken && force) {
         plannedActions.push(`rotate token '${tokenName}' (delete + recreate)`);
@@ -333,7 +372,7 @@ export async function ensureServiceAccount(
     if (!confirm) {
       if (plannedActions.length > 0) {
         console.log(
-          `[ensureServiceAccount] DRY RUN — re-run with confirm:true to apply`,
+          `[ensureServiceAccount] DRY RUN -- re-run with confirm:true to apply`,
         );
       }
       const handle = await context.writeResource(
@@ -523,7 +562,7 @@ export async function configureWebhookContactPoint(
 
     // Webhook settings. On update, MERGE onto the existing point's settings so
     // out-of-band keys the operator set (auth header, HMAC secret, TLS config)
-    // survive — this method only owns url/httpMethod (and title/message when
+    // survive -- this method only owns url/httpMethod (and title/message when
     // supplied). Empty title/message are left untouched rather than nulled.
     const settings: Record<string, unknown> = {
       ...(existing?.settings ?? {}),
@@ -559,7 +598,7 @@ export async function configureWebhookContactPoint(
 
     if (!confirm) {
       console.log(
-        `[configureWebhookContactPoint] DRY RUN — re-run with confirm:true to apply`,
+        `[configureWebhookContactPoint] DRY RUN -- re-run with confirm:true to apply`,
       );
       const handle = await context.writeResource(
         "contactPoint",
@@ -650,7 +689,7 @@ interface FolderSummary {
 
 /**
  * Core of `ensureFolder`, extracted so tests can drive it directly. Ensures a
- * Grafana folder of `title` exists in `orgId` and returns its uid — alert
+ * Grafana folder of `title` exists in `orgId` and returns its uid -- alert
  * rules need a folderUID. Idempotent (matched by title); creates only when
  * absent. Dry-run unless `confirm`; on a dry run with no existing folder the
  * returned uid is the *desired* uid (when supplied) or undefined.
@@ -669,12 +708,8 @@ export async function ensureFolder(
   try {
     await grafanaAdminRequest(cfg, "POST", `/api/user/using/${orgId}`);
 
-    const list = (await grafanaAdminRequest(
-      cfg,
-      "GET",
-      "/api/folders?limit=1000",
-    )) as unknown as FolderSummary[];
-    const existing = (list ?? []).find((f) => f.title === title);
+    const list = await listAllFolders(cfg);
+    const existing = list.find((f) => f.title === title);
 
     const plannedActions: string[] = [];
     if (!existing) {
@@ -696,7 +731,7 @@ export async function ensureFolder(
     if (!confirm || existing) {
       if (!confirm && !existing) {
         console.log(
-          `[ensureFolder] DRY RUN — re-run with confirm:true to create`,
+          `[ensureFolder] DRY RUN -- re-run with confirm:true to create`,
         );
       }
       const handle = await context.writeResource(
@@ -758,8 +793,8 @@ interface OrgSummary {
 
 /**
  * Core of `listOrgs`, extracted so tests can drive it directly. Lists every
- * org visible to the server admin (`GET /api/orgs`) — a read-only discovery
- * step, no org switch and nothing mutated — and writes an `orgs` snapshot so
+ * org visible to the server admin (`GET /api/orgs`) -- a read-only discovery
+ * step, no org switch and nothing mutated -- and writes an `orgs` snapshot so
  * the id backing a tenant can be referenced via CEL before minting a service
  * account into it.
  */
@@ -774,7 +809,7 @@ export async function listOrgs(
   )) as unknown as OrgSummary[];
   const orgs = (raw ?? []).map((o) => ({ id: o.id, name: o.name }));
 
-  console.log(`[listOrgs] ${cfg.grafanaUrl} — ${orgs.length} org(s):`);
+  console.log(`[listOrgs] ${cfg.grafanaUrl} -- ${orgs.length} org(s):`);
   for (const o of orgs) console.log(`  - ${o.id}: ${o.name}`);
 
   const handle = await context.writeResource("orgs", "orgs", {
@@ -794,7 +829,7 @@ interface EnsureOrgArgs {
 /**
  * Core of `ensureOrg`, extracted so tests can drive it directly. Ensures a
  * Grafana org of `name` exists and returns its id. Org CRUD is server-admin
- * global, so there is no org switch. Idempotent — matched by name against
+ * global, so there is no org switch. Idempotent -- matched by name against
  * `GET /api/orgs`, created only when absent. Dry-run unless `confirm`.
  */
 export async function ensureOrg(
@@ -827,7 +862,7 @@ export async function ensureOrg(
   // Dry run, or nothing to do (org already exists): report state, mutate nothing.
   if (!confirm || existing) {
     if (!confirm && !existing) {
-      console.log(`[ensureOrg] DRY RUN — re-run with confirm:true to create`);
+      console.log(`[ensureOrg] DRY RUN -- re-run with confirm:true to create`);
     }
     const handle = await context.writeResource("org", name, {
       grafanaUrl: cfg.grafanaUrl,
@@ -954,7 +989,7 @@ export async function ensureDatasource(
 
     if (!confirm) {
       console.log(
-        `[ensureDatasource] DRY RUN — re-run with confirm:true to apply`,
+        `[ensureDatasource] DRY RUN -- re-run with confirm:true to apply`,
       );
       const handle = await context.writeResource(
         "datasource",
@@ -1044,7 +1079,17 @@ export async function ensureDatasource(
  */
 export const model = {
   type: "@shrug/grafana-admin/instance",
-  version: "2026.11.18.1",
+  version: "2026.11.18.2",
+  upgrades: [
+    {
+      toVersion: "2026.11.18.2",
+      description:
+        "Version bump only. The additive methods/resources (listOrgs, ensureOrg, ensureDatasource, configureWebhookContactPoint, ensureFolder) and the server-admin basic-auth globalArguments are unchanged in shape, so existing instances re-validate -- identity migration.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+  ],
   description:
     "Grafana control-plane over admin basic-auth: list orgs, idempotently ensure an org, a tenant-scoped datasource (X-Scope-OrgID in secureJsonData), a service account (and optionally mint its token), a webhook (e.g. ntfy) contact point, or a folder. Dry-run by default; confirm:true to apply.",
   globalArguments: GlobalArgsSchema,
@@ -1095,7 +1140,7 @@ export const model = {
   methods: {
     listOrgs: {
       description:
-        "List every org visible to the server admin (GET /api/orgs). Read-only discovery — use it to find the org id backing a tenant before ensuring a service account into it.",
+        "List every org visible to the server admin (GET /api/orgs). Read-only discovery -- use it to find the org id backing a tenant before ensuring a service account into it.",
       arguments: z.object({}),
       execute: (
         _args: Record<string, never>,
@@ -1112,7 +1157,7 @@ export const model = {
         confirm: z
           .boolean()
           .default(false)
-          .describe("Must be true to create — otherwise a read-only dry run"),
+          .describe("Must be true to create -- otherwise a read-only dry run"),
       }),
       execute: (
         args: { name: string; confirm: boolean },
@@ -1148,7 +1193,7 @@ export const model = {
         confirm: z
           .boolean()
           .default(false)
-          .describe("Must be true to apply — otherwise a read-only dry run"),
+          .describe("Must be true to apply -- otherwise a read-only dry run"),
       }),
       execute: (
         args: {
@@ -1193,7 +1238,7 @@ export const model = {
         confirm: z
           .boolean()
           .default(false)
-          .describe("Must be true to apply — otherwise a read-only dry run"),
+          .describe("Must be true to apply -- otherwise a read-only dry run"),
       }),
       execute: (
         args: {
@@ -1226,7 +1271,7 @@ export const model = {
           "Contact point name (match key for idempotency; alert rules route to it by name)",
         ),
         url: z.string().describe(
-          "Webhook target URL — e.g. the ntfy topic URL https://ntfy.example/<topic>",
+          "Webhook target URL -- e.g. the ntfy topic URL https://ntfy.example/<topic>",
         ),
         httpMethod: z
           .enum(["POST", "PUT"])
@@ -1251,7 +1296,7 @@ export const model = {
         confirm: z
           .boolean()
           .default(false)
-          .describe("Must be true to apply — otherwise a read-only dry run"),
+          .describe("Must be true to apply -- otherwise a read-only dry run"),
       }),
       execute: (
         args: {
@@ -1286,7 +1331,7 @@ export const model = {
         confirm: z
           .boolean()
           .default(false)
-          .describe("Must be true to create — otherwise a read-only dry run"),
+          .describe("Must be true to create -- otherwise a read-only dry run"),
       }),
       execute: (
         args: { orgId: number; title: string; uid: string; confirm: boolean },
@@ -1303,6 +1348,8 @@ export const model = {
         "ensureServiceAccount",
         "configureWebhookContactPoint",
         "ensureFolder",
+        "ensureOrg",
+        "ensureDatasource",
       ],
       execute: async (
         context: { globalArgs: GlobalArgs },
@@ -1317,7 +1364,7 @@ export const model = {
             return {
               pass: false,
               errors: [
-                "GET /api/user returned no login — unexpected admin identity",
+                "GET /api/user returned no login -- unexpected admin identity",
               ],
             };
           }

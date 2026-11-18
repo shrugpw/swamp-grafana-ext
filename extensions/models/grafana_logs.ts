@@ -1,12 +1,12 @@
 /**
- * Extends `@keeb/grafana/instance` with `queryLogs` — the Loki sibling of the
+ * Extends `@keeb/grafana/instance` with `queryLogs` -- the Loki sibling of the
  * model's existing `queryMetrics`.
  *
  * Same shape and credential as `queryMetrics`: it authenticates with the
  * instance's service-account Bearer token (`globalArgs.apiKey`), auto-discovers
  * the Loki datasource, and reads through Grafana's datasource proxy
  * (`GET /api/datasources/proxy/{id}/loki/api/v1/query_range`) with the LogQL
- * query URL-encoded — so no shell escaping and no direct Loki credentials are
+ * query URL-encoded -- so no shell escaping and no direct Loki credentials are
  * needed. It replaces the ad-hoc read-only `curl` against the Loki DS proxy,
  * keeping "swamp-native reads" whole (metrics AND logs off one instance model).
  *
@@ -136,7 +136,7 @@ export async function queryLogs(
 
   console.log(`[queryLogs] Query: ${query}`);
   console.log(
-    `[queryLogs] Range: ${new Date(startSec * 1000).toISOString()} → ${
+    `[queryLogs] Range: ${new Date(startSec * 1000).toISOString()} -> ${
       new Date(endSec * 1000).toISOString()
     } limit=${limit} direction=${direction}`,
   );
@@ -186,7 +186,7 @@ export async function queryLogs(
   }
 
   console.log(
-    `\n[queryLogs] Done — ${series.length} streams, ${lineCount} lines returned`,
+    `\n[queryLogs] Done -- ${series.length} streams, ${lineCount} lines returned`,
   );
 
   const handle = await context.writeResource(
