@@ -14,7 +14,12 @@
  * @module
  */
 import { assertEquals, assertRejects } from "jsr:@std/assert@1";
-import { ensureServiceAccount } from "./grafana_admin.ts";
+import {
+  configureWebhookContactPoint,
+  ensureFolder,
+  ensureServiceAccount,
+  listOrgs,
+} from "./grafana_admin.ts";
 
 type Reply = { status?: number; body?: unknown };
 type Handler = Reply | (() => Reply);
@@ -96,6 +101,37 @@ const baseArgs = {
   force: false,
   confirm: false,
 };
+
+Deno.test("listOrgs: read-only, writes an orgs snapshot, no org switch", async () => {
+  const mock = installFetch({
+    "GET /api/orgs": {
+      body: [
+        { id: 1, name: "Main Org." },
+        { id: 3, name: "WidgetCo" },
+      ],
+    },
+  });
+  try {
+    const { context, writes } = stubContext();
+    const res = await listOrgs(context);
+    // Only the read happened — nothing mutating, no org switch.
+    assertEquals(mock.calls.length, 1);
+    assertEquals(mock.calls[0].method, "GET");
+    assertEquals(mock.calls[0].path, "/api/orgs");
+    // Snapshot captured both orgs, projected to {id,name}.
+    const w = writes[0];
+    assertEquals(w.spec, "orgs");
+    assertEquals(w.name, "orgs");
+    assertEquals(w.data.count, 2);
+    assertEquals(w.data.orgs, [
+      { id: 1, name: "Main Org." },
+      { id: 3, name: "WidgetCo" },
+    ]);
+    assertEquals(res.dataHandles.length, 1);
+  } finally {
+    mock.restore();
+  }
+});
 
 Deno.test("dry run: plans create but mutates nothing, restores org", async () => {
   const mock = installFetch({
@@ -256,5 +292,236 @@ Deno.test("empty name is rejected", async () => {
     () => ensureServiceAccount({ ...baseArgs, name: "" }, context),
     Error,
     "name is required",
+  );
+});
+
+// --- configureWebhookContactPoint ------------------------------------------
+
+const cpArgs = {
+  orgId: 1,
+  name: "ntfy-bed-infra",
+  url: "https://ntfy.example/bed-infra",
+  httpMethod: "POST" as const,
+  disableResolveMessage: false,
+  title: "",
+  message: "",
+  confirm: false,
+};
+
+Deno.test("contact point dry run: plans create, mutates nothing, restores org", async () => {
+  const mock = installFetch({
+    "GET /api/user": { body: { login: "admin", orgId: 2 } },
+    "POST /api/user/using/1": { body: { message: "ok" } },
+    "GET /api/v1/provisioning/contact-points": { body: [] },
+    "POST /api/user/using/2": { body: { message: "ok" } },
+  });
+  try {
+    const { context, writes } = stubContext();
+    const res = await configureWebhookContactPoint({ ...cpArgs }, context);
+    // No create/update happened.
+    const mutating = mock.calls.filter((c) =>
+      c.method !== "GET" && !c.path.startsWith("/api/user/using/")
+    );
+    assertEquals(mutating.length, 0);
+    // Original org (2) restored.
+    assertEquals(mock.calls.some((c) => c.path === "/api/user/using/2"), true);
+    const w = writes[0].data;
+    assertEquals(w.existed, false);
+    assertEquals(w.mutated, false);
+    assertEquals(w.contactType, "webhook");
+    assertEquals((w.plannedActions as string[]).length, 1);
+    assertEquals(res.dataHandles.length, 1);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("contact point confirm: creates when absent (POST, type webhook)", async () => {
+  const mock = installFetch({
+    "GET /api/user": { body: { login: "admin", orgId: 1 } },
+    "POST /api/user/using/1": { body: { message: "ok" } },
+    "GET /api/v1/provisioning/contact-points": { body: [] },
+    "POST /api/v1/provisioning/contact-points": {
+      body: { uid: "cp-uid-1", name: "ntfy-bed-infra", type: "webhook" },
+    },
+  });
+  try {
+    const { context, writes } = stubContext();
+    await configureWebhookContactPoint({ ...cpArgs, confirm: true }, context);
+    const post = mock.calls.find((c) =>
+      c.method === "POST" && c.path === "/api/v1/provisioning/contact-points"
+    );
+    assertEquals((post?.body as { type: string }).type, "webhook");
+    assertEquals(
+      (post?.body as { settings: { url: string } }).settings.url,
+      "https://ntfy.example/bed-infra",
+    );
+    const w = writes[0].data;
+    assertEquals(w.mutated, true);
+    assertEquals(w.existed, false);
+    assertEquals(w.uid, "cp-uid-1");
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("contact point confirm: updates existing in place (PUT by uid), no duplicate", async () => {
+  const mock = installFetch({
+    "GET /api/user": { body: { login: "admin", orgId: 1 } },
+    "POST /api/user/using/1": { body: { message: "ok" } },
+    "GET /api/v1/provisioning/contact-points": {
+      body: [{ uid: "cp-existing", name: "ntfy-bed-infra", type: "webhook" }],
+    },
+    "PUT /api/v1/provisioning/contact-points/cp-existing": {
+      body: { uid: "cp-existing" },
+    },
+  });
+  try {
+    const { context, writes } = stubContext();
+    await configureWebhookContactPoint({ ...cpArgs, confirm: true }, context);
+    // No POST-create happened — updated in place.
+    assertEquals(
+      mock.calls.some((c) =>
+        c.method === "POST" && c.path === "/api/v1/provisioning/contact-points"
+      ),
+      false,
+    );
+    const put = mock.calls.find((c) => c.method === "PUT");
+    assertEquals(put?.path, "/api/v1/provisioning/contact-points/cp-existing");
+    assertEquals(writes[0].data.mutated, true);
+    assertEquals(writes[0].data.existed, true);
+    assertEquals(writes[0].data.uid, "cp-existing");
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("contact point update: preserves out-of-band settings (no clobber)", async () => {
+  const mock = installFetch({
+    "GET /api/user": { body: { login: "admin", orgId: 1 } },
+    "POST /api/user/using/1": { body: { message: "ok" } },
+    "GET /api/v1/provisioning/contact-points": {
+      body: [{
+        uid: "cp-existing",
+        name: "ntfy-bed-infra",
+        type: "webhook",
+        settings: {
+          url: "https://old.example/topic",
+          httpMethod: "POST",
+          authorization_credentials: "tok_set_out_of_band",
+        },
+      }],
+    },
+    "PUT /api/v1/provisioning/contact-points/cp-existing": {
+      body: { uid: "cp-existing" },
+    },
+  });
+  try {
+    const { context } = stubContext();
+    await configureWebhookContactPoint({ ...cpArgs, confirm: true }, context);
+    const put = mock.calls.find((c) => c.method === "PUT");
+    const sent = (put?.body as { settings: Record<string, unknown> }).settings;
+    // url updated...
+    assertEquals(sent.url, "https://ntfy.example/bed-infra");
+    // ...but the operator's out-of-band credential survived.
+    assertEquals(sent.authorization_credentials, "tok_set_out_of_band");
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("contact point: empty url is rejected", async () => {
+  const { context } = stubContext();
+  await assertRejects(
+    () => configureWebhookContactPoint({ ...cpArgs, url: "" }, context),
+    Error,
+    "url is required",
+  );
+});
+
+// --- ensureFolder -----------------------------------------------------------
+
+const folderArgs = {
+  orgId: 1,
+  title: "Bed Host Health",
+  uid: "",
+  confirm: false,
+};
+
+Deno.test("ensureFolder dry run: plans create, mutates nothing", async () => {
+  const mock = installFetch({
+    "GET /api/user": { body: { login: "admin", orgId: 1 } },
+    "POST /api/user/using/1": { body: { message: "ok" } },
+    "GET /api/folders": { body: [] },
+  });
+  try {
+    const { context, writes } = stubContext();
+    await ensureFolder({ ...folderArgs }, context);
+    assertEquals(
+      mock.calls.some((c) => c.method === "POST" && c.path === "/api/folders"),
+      false,
+    );
+    const w = writes[0].data;
+    assertEquals(w.existed, false);
+    assertEquals(w.mutated, false);
+    assertEquals((w.plannedActions as string[]).length, 1);
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("ensureFolder idempotent: returns existing uid without creating", async () => {
+  const mock = installFetch({
+    "GET /api/user": { body: { login: "admin", orgId: 1 } },
+    "POST /api/user/using/1": { body: { message: "ok" } },
+    "GET /api/folders": {
+      body: [{ uid: "folder-uid-9", title: "Bed Host Health" }],
+    },
+  });
+  try {
+    const { context, writes } = stubContext();
+    // Even with confirm:true, an existing folder is not re-created.
+    await ensureFolder({ ...folderArgs, confirm: true }, context);
+    assertEquals(
+      mock.calls.some((c) => c.method === "POST" && c.path === "/api/folders"),
+      false,
+    );
+    const w = writes[0].data;
+    assertEquals(w.existed, true);
+    assertEquals(w.mutated, false);
+    assertEquals(w.uid, "folder-uid-9");
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("ensureFolder confirm: creates when absent and returns new uid", async () => {
+  const mock = installFetch({
+    "GET /api/user": { body: { login: "admin", orgId: 1 } },
+    "POST /api/user/using/1": { body: { message: "ok" } },
+    "GET /api/folders": { body: [] },
+    "POST /api/folders": { body: { uid: "folder-new", title: "Bed Host Health" } },
+  });
+  try {
+    const { context, writes } = stubContext();
+    await ensureFolder({ ...folderArgs, confirm: true }, context);
+    const post = mock.calls.find((c) =>
+      c.method === "POST" && c.path === "/api/folders"
+    );
+    assertEquals((post?.body as { title: string }).title, "Bed Host Health");
+    const w = writes[0].data;
+    assertEquals(w.mutated, true);
+    assertEquals(w.uid, "folder-new");
+  } finally {
+    mock.restore();
+  }
+});
+
+Deno.test("ensureFolder: empty title is rejected", async () => {
+  const { context } = stubContext();
+  await assertRejects(
+    () => ensureFolder({ ...folderArgs, title: "" }, context),
+    Error,
+    "title is required",
   );
 });

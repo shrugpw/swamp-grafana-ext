@@ -109,6 +109,64 @@ const ServiceAccountSchema = z.object({
   ensuredAt: z.iso.datetime(),
 });
 
+// A webhook (e.g. ntfy) contact point ensured in a given org. Idempotent:
+// keyed by (orgId, name); an existing point of the same name is updated in
+// place (PUT by uid) rather than duplicated.
+const ContactPointSchema = z.object({
+  grafanaUrl: z.string(),
+  orgId: z.number(),
+  name: z.string(),
+  contactType: z.string().describe("Grafana contact-point type (webhook)"),
+  url: z.string().describe("Webhook target URL (the ntfy topic URL)"),
+  httpMethod: z.string(),
+  uid: z.string().optional().describe(
+    "Grafana-assigned uid (present once the point exists)",
+  ),
+  existed: z.boolean().describe(
+    "Whether a contact point of this name existed before this run",
+  ),
+  mutated: z.boolean().describe(
+    "Whether this run changed Grafana (confirm:true)",
+  ),
+  plannedActions: z
+    .array(z.string())
+    .describe("Actions this run would (dry-run) or did (confirm) take"),
+  ensuredAt: z.iso.datetime(),
+});
+
+// A Grafana folder ensured by title. Alert rules need a folderUID; this
+// returns a stable uid, creating the folder only when absent.
+const FolderSchema = z.object({
+  grafanaUrl: z.string(),
+  orgId: z.number(),
+  title: z.string(),
+  uid: z.string().optional().describe(
+    "Folder uid (present once the folder exists)",
+  ),
+  existed: z.boolean().describe(
+    "Whether a folder of this title existed before this run",
+  ),
+  mutated: z.boolean().describe(
+    "Whether this run changed Grafana (confirm:true)",
+  ),
+  plannedActions: z
+    .array(z.string())
+    .describe("Actions this run would (dry-run) or did (confirm) take"),
+  ensuredAt: z.iso.datetime(),
+});
+
+// A read-only snapshot of the orgs visible to the server admin. Written by
+// `listOrgs` so the org id backing a tenant (e.g. the Mimir X-Scope-OrgID) can
+// be discovered before minting a service account into it.
+const OrgsSchema = z.object({
+  grafanaUrl: z.string(),
+  orgs: z
+    .array(z.object({ id: z.number(), name: z.string() }))
+    .describe("All orgs returned by GET /api/orgs (server-admin scope)"),
+  count: z.number(),
+  listedAt: z.iso.datetime(),
+});
+
 // --- Execute context --------------------------------------------------------
 
 interface ExecuteContext {
@@ -352,6 +410,310 @@ export async function ensureServiceAccount(
   }
 }
 
+interface EnsureContactPointArgs {
+  orgId: number;
+  name: string;
+  url: string;
+  httpMethod: string;
+  disableResolveMessage: boolean;
+  title: string;
+  message: string;
+  confirm: boolean;
+}
+
+interface ContactPointSummary {
+  uid?: string;
+  name?: string;
+  type?: string;
+  settings?: Record<string, unknown>;
+}
+
+/**
+ * Core of `configureWebhookContactPoint`, extracted so tests can drive it
+ * directly. Ensures a generic **webhook**-type contact point (e.g. an ntfy
+ * topic) exists in `orgId`, keyed by `name`: an existing point of the same
+ * name is updated in place (PUT by uid), never duplicated. Dry-run unless
+ * `confirm`. The admin's active org is switched for the operation and always
+ * restored in the `finally`.
+ */
+export async function configureWebhookContactPoint(
+  args: EnsureContactPointArgs,
+  context: ExecuteContext,
+): Promise<ExecuteResult> {
+  const cfg = context.globalArgs;
+  const { orgId, name, url, httpMethod, disableResolveMessage, title, message } =
+    args;
+  const { confirm } = args;
+  if (!name) throw new Error("name is required");
+  if (!url) throw new Error("url is required");
+
+  const me = await grafanaAdminRequest(cfg, "GET", "/api/user");
+  const originalOrg = typeof me.orgId === "number" ? me.orgId : undefined;
+
+  try {
+    await grafanaAdminRequest(cfg, "POST", `/api/user/using/${orgId}`);
+
+    // Contact points are org-scoped; list and match by name.
+    const list = (await grafanaAdminRequest(
+      cfg,
+      "GET",
+      `/api/v1/provisioning/contact-points?name=${encodeURIComponent(name)}`,
+    )) as unknown as ContactPointSummary[];
+    const existing = (list ?? []).find((cp) => cp.name === name);
+
+    // Webhook settings. On update, MERGE onto the existing point's settings so
+    // out-of-band keys the operator set (auth header, HMAC secret, TLS config)
+    // survive — this method only owns url/httpMethod (and title/message when
+    // supplied). Empty title/message are left untouched rather than nulled.
+    const settings: Record<string, unknown> = {
+      ...(existing?.settings ?? {}),
+      url,
+      httpMethod,
+    };
+    if (title) settings.title = title;
+    if (message) settings.message = message;
+
+    const contactPoint: Record<string, unknown> = {
+      name,
+      type: "webhook",
+      settings,
+      disableResolveMessage,
+    };
+
+    const plannedActions: string[] = [];
+    if (!existing) {
+      plannedActions.push(
+        `create webhook contact point '${name}' -> ${url}`,
+      );
+    } else {
+      plannedActions.push(
+        `update webhook contact point '${name}' (uid ${existing.uid}) -> ${url}`,
+      );
+    }
+
+    console.log(
+      `[configureWebhookContactPoint] org=${orgId} name='${name}' ` +
+        `type=webhook existed=${!!existing} confirm=${confirm}`,
+    );
+    for (const a of plannedActions) console.log(`  - ${a}`);
+
+    if (!confirm) {
+      console.log(
+        `[configureWebhookContactPoint] DRY RUN — re-run with confirm:true to apply`,
+      );
+      const handle = await context.writeResource(
+        "contactPoint",
+        `${orgId}-${name}`,
+        {
+          grafanaUrl: cfg.grafanaUrl,
+          orgId,
+          name,
+          contactType: "webhook",
+          url,
+          httpMethod,
+          uid: existing?.uid,
+          existed: !!existing,
+          mutated: false,
+          plannedActions,
+          ensuredAt: new Date().toISOString(),
+        },
+      );
+      return { dataHandles: [handle] };
+    }
+
+    let uid = existing?.uid;
+    if (!existing) {
+      const created = await grafanaAdminRequest(
+        cfg,
+        "POST",
+        "/api/v1/provisioning/contact-points",
+        contactPoint,
+      );
+      uid = created.uid as string | undefined;
+      console.log(
+        `[configureWebhookContactPoint] created contact point uid=${uid}`,
+      );
+    } else {
+      await grafanaAdminRequest(
+        cfg,
+        "PUT",
+        `/api/v1/provisioning/contact-points/${existing.uid}`,
+        { uid: existing.uid, ...contactPoint },
+      );
+      console.log(
+        `[configureWebhookContactPoint] updated contact point uid=${existing.uid}`,
+      );
+    }
+
+    const handle = await context.writeResource(
+      "contactPoint",
+      `${orgId}-${name}`,
+      {
+        grafanaUrl: cfg.grafanaUrl,
+        orgId,
+        name,
+        contactType: "webhook",
+        url,
+        httpMethod,
+        uid,
+        existed: !!existing,
+        mutated: true,
+        plannedActions,
+        ensuredAt: new Date().toISOString(),
+      },
+    );
+    return { dataHandles: [handle] };
+  } finally {
+    if (originalOrg !== undefined && originalOrg !== orgId) {
+      try {
+        await grafanaAdminRequest(cfg, "POST", `/api/user/using/${originalOrg}`);
+      } catch (_e) { /* best-effort restore */ }
+    }
+  }
+}
+
+interface EnsureFolderArgs {
+  orgId: number;
+  title: string;
+  uid: string;
+  confirm: boolean;
+}
+
+interface FolderSummary {
+  uid?: string;
+  title?: string;
+}
+
+/**
+ * Core of `ensureFolder`, extracted so tests can drive it directly. Ensures a
+ * Grafana folder of `title` exists in `orgId` and returns its uid — alert
+ * rules need a folderUID. Idempotent (matched by title); creates only when
+ * absent. Dry-run unless `confirm`; on a dry run with no existing folder the
+ * returned uid is the *desired* uid (when supplied) or undefined.
+ */
+export async function ensureFolder(
+  args: EnsureFolderArgs,
+  context: ExecuteContext,
+): Promise<ExecuteResult> {
+  const cfg = context.globalArgs;
+  const { orgId, title, uid: desiredUid, confirm } = args;
+  if (!title) throw new Error("title is required");
+
+  const me = await grafanaAdminRequest(cfg, "GET", "/api/user");
+  const originalOrg = typeof me.orgId === "number" ? me.orgId : undefined;
+
+  try {
+    await grafanaAdminRequest(cfg, "POST", `/api/user/using/${orgId}`);
+
+    const list = (await grafanaAdminRequest(
+      cfg,
+      "GET",
+      "/api/folders?limit=1000",
+    )) as unknown as FolderSummary[];
+    const existing = (list ?? []).find((f) => f.title === title);
+
+    const plannedActions: string[] = [];
+    if (!existing) {
+      plannedActions.push(
+        `create folder '${title}'` +
+          (desiredUid ? ` (uid ${desiredUid})` : ""),
+      );
+    }
+
+    console.log(
+      `[ensureFolder] org=${orgId} title='${title}' existed=${!!existing} ` +
+        `confirm=${confirm}`,
+    );
+    for (const a of plannedActions) console.log(`  - ${a}`);
+    if (plannedActions.length === 0) {
+      console.log(`  (folder already exists, uid=${existing?.uid})`);
+    }
+
+    if (!confirm || existing) {
+      if (!confirm && !existing) {
+        console.log(
+          `[ensureFolder] DRY RUN — re-run with confirm:true to create`,
+        );
+      }
+      const handle = await context.writeResource("folder", `${orgId}-${title}`, {
+        grafanaUrl: cfg.grafanaUrl,
+        orgId,
+        title,
+        uid: existing?.uid ?? (desiredUid || undefined),
+        existed: !!existing,
+        mutated: false,
+        plannedActions,
+        ensuredAt: new Date().toISOString(),
+      });
+      return { dataHandles: [handle] };
+    }
+
+    const body: Record<string, unknown> = { title };
+    if (desiredUid) body.uid = desiredUid;
+    const created = await grafanaAdminRequest(
+      cfg,
+      "POST",
+      "/api/folders",
+      body,
+    );
+    const uid = created.uid as string | undefined;
+    console.log(`[ensureFolder] created folder uid=${uid}`);
+
+    const handle = await context.writeResource("folder", `${orgId}-${title}`, {
+      grafanaUrl: cfg.grafanaUrl,
+      orgId,
+      title,
+      uid,
+      existed: false,
+      mutated: true,
+      plannedActions,
+      ensuredAt: new Date().toISOString(),
+    });
+    return { dataHandles: [handle] };
+  } finally {
+    if (originalOrg !== undefined && originalOrg !== orgId) {
+      try {
+        await grafanaAdminRequest(cfg, "POST", `/api/user/using/${originalOrg}`);
+      } catch (_e) { /* best-effort restore */ }
+    }
+  }
+}
+
+interface OrgSummary {
+  id: number;
+  name: string;
+}
+
+/**
+ * Core of `listOrgs`, extracted so tests can drive it directly. Lists every
+ * org visible to the server admin (`GET /api/orgs`) — a read-only discovery
+ * step, no org switch and nothing mutated — and writes an `orgs` snapshot so
+ * the id backing a tenant can be referenced via CEL before minting a service
+ * account into it.
+ */
+export async function listOrgs(
+  context: ExecuteContext,
+): Promise<ExecuteResult> {
+  const cfg = context.globalArgs;
+  const raw = (await grafanaAdminRequest(
+    cfg,
+    "GET",
+    "/api/orgs",
+  )) as unknown as OrgSummary[];
+  const orgs = (raw ?? []).map((o) => ({ id: o.id, name: o.name }));
+
+  console.log(`[listOrgs] ${cfg.grafanaUrl} — ${orgs.length} org(s):`);
+  for (const o of orgs) console.log(`  - ${o.id}: ${o.name}`);
+
+  const handle = await context.writeResource("orgs", "orgs", {
+    grafanaUrl: cfg.grafanaUrl,
+    orgs,
+    count: orgs.length,
+    listedAt: new Date().toISOString(),
+  });
+  return { dataHandles: [handle] };
+}
+
 // --- Model ------------------------------------------------------------------
 
 /**
@@ -362,9 +724,9 @@ export async function ensureServiceAccount(
  */
 export const model = {
   type: "@shrug/grafana-admin/instance",
-  version: "2026.07.11.1",
+  version: "2026.08.21.1",
   description:
-    "Grafana control-plane over admin basic-auth: idempotently ensure a service account (and optionally mint its token) in a given org. Dry-run by default; confirm:true to apply.",
+    "Grafana control-plane over admin basic-auth: list orgs, and idempotently ensure a service account (and optionally mint its token), a webhook (e.g. ntfy) contact point, or a folder in a given org. Dry-run by default; confirm:true to apply.",
   globalArguments: GlobalArgsSchema,
   resources: {
     "serviceAccount": {
@@ -374,8 +736,37 @@ export const model = {
       lifetime: "infinite",
       garbageCollection: 50,
     },
+    "contactPoint": {
+      description:
+        "State + plan for an ensured webhook (e.g. ntfy) contact point",
+      schema: ContactPointSchema,
+      lifetime: "infinite",
+      garbageCollection: 50,
+    },
+    "folder": {
+      description: "State + plan for an ensured Grafana folder (returns its uid)",
+      schema: FolderSchema,
+      lifetime: "infinite",
+      garbageCollection: 50,
+    },
+    "orgs": {
+      description:
+        "Read-only snapshot of all orgs visible to the server admin (GET /api/orgs)",
+      schema: OrgsSchema,
+      lifetime: "1h",
+      garbageCollection: 10,
+    },
   },
   methods: {
+    listOrgs: {
+      description:
+        "List every org visible to the server admin (GET /api/orgs). Read-only discovery — use it to find the org id backing a tenant before ensuring a service account into it.",
+      arguments: z.object({}),
+      execute: (
+        _args: Record<string, never>,
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => listOrgs(context),
+    },
     ensureServiceAccount: {
       description:
         "Idempotently ensure a service account with the given role exists in an org, optionally minting a token. Dry-run unless confirm:true; the minted secret is printed once and never persisted.",
@@ -428,13 +819,95 @@ export const model = {
           context,
         ),
     },
+    configureWebhookContactPoint: {
+      description:
+        "Idempotently ensure a generic webhook-type contact point (e.g. pointing at an ntfy topic URL) in an org, keyed by name. Dry-run unless confirm:true; an existing point of the same name is updated in place, never duplicated.",
+      arguments: z.object({
+        orgId: z.number().default(1).describe(
+          "Target Grafana org id (e.g. 1 = Main Org.)",
+        ),
+        name: z.string().describe(
+          "Contact point name (match key for idempotency; alert rules route to it by name)",
+        ),
+        url: z.string().describe(
+          "Webhook target URL — e.g. the ntfy topic URL https://ntfy.example/<topic>",
+        ),
+        httpMethod: z
+          .enum(["POST", "PUT"])
+          .default("POST")
+          .describe("HTTP method Grafana uses to call the webhook"),
+        disableResolveMessage: z
+          .boolean()
+          .default(false)
+          .describe("Suppress the follow-up 'resolved' notification"),
+        title: z
+          .string()
+          .default("")
+          .describe(
+            "Optional Grafana notification title template (left unset if empty)",
+          ),
+        message: z
+          .string()
+          .default("")
+          .describe(
+            "Optional Grafana notification message/body template (left unset if empty)",
+          ),
+        confirm: z
+          .boolean()
+          .default(false)
+          .describe("Must be true to apply — otherwise a read-only dry run"),
+      }),
+      execute: (
+        args: {
+          orgId: number;
+          name: string;
+          url: string;
+          httpMethod: "POST" | "PUT";
+          disableResolveMessage: boolean;
+          title: string;
+          message: string;
+          confirm: boolean;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => configureWebhookContactPoint(args, context),
+    },
+    ensureFolder: {
+      description:
+        "Idempotently ensure a Grafana folder of the given title exists in an org and return its uid (alert rules need a folderUID). Dry-run unless confirm:true; matched by title, created only when absent.",
+      arguments: z.object({
+        orgId: z.number().default(1).describe(
+          "Target Grafana org id (e.g. 1 = Main Org.)",
+        ),
+        title: z.string().describe(
+          "Folder title (match key for idempotency)",
+        ),
+        uid: z
+          .string()
+          .default("")
+          .describe(
+            "Optional desired folder uid when creating (Grafana assigns one if empty)",
+          ),
+        confirm: z
+          .boolean()
+          .default(false)
+          .describe("Must be true to create — otherwise a read-only dry run"),
+      }),
+      execute: (
+        args: { orgId: number; title: string; uid: string; confirm: boolean },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => ensureFolder(args, context),
+    },
   },
   checks: {
     "admin-authenticates": {
       description:
         "Verify the Grafana admin basic-auth credentials work (GET /api/user) before mutating",
       labels: ["live"],
-      appliesTo: ["ensureServiceAccount"],
+      appliesTo: [
+        "ensureServiceAccount",
+        "configureWebhookContactPoint",
+        "ensureFolder",
+      ],
       execute: async (
         context: { globalArgs: GlobalArgs },
       ): Promise<{ pass: boolean; errors?: string[] }> => {
